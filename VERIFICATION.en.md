@@ -2,7 +2,16 @@
 
 [中文](VERIFICATION.md)
 
-Date: 2026-09-05. Results apply to the environments and versions listed below.
+## 2026-11-03: interactive upgrade disconnect and terminal output
+
+- `bash -n snell.sh`, ShellCheck and all 20 Linux/root test groups passed; all 8 portable macOS groups passed.
+- The new foreground-handoff regression failed against an isolated copy of the original `09fc7ec` and passed against the fix.
+- Disposable Debian 12 / aarch64 systemd acceptance passed with 5.0.1 and 6.0.0: sending SIGHUP to the interactive frontend during the upgrade transaction did not interrupt the worker. Concurrent-operation refusal, status during upgrades, connected completion, failed health-check rollback, failed-task retry, and reinstall after uninstall also passed.
+- Status and version-list output were exercised in a terminal. Color, `NO_COLOR`, `TERM=dumb`, redirected plain text and plain configuration export in a terminal were checked.
+- Ubuntu 24.04.4 / aarch64 acceptance was blocked by TLS timeouts during the initial installation download, before the disconnect test. This change has not been tested on amd64 or with end-to-end Surge traffic, and has not been deployed to production.
+- Reproduce with `tests/upgrade-acceptance.sh`. Reverting this code change requires no deployment-data migration.
+
+The following historical record is dated 2026-09-05 and applies only to the environments and versions tested then.
 
 ## Discovery and support
 

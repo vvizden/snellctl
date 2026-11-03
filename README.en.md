@@ -55,7 +55,11 @@ Run these commands on your server:
 | Export the current Surge configuration | `sudo snellctl export` |
 | Read recent logs | `sudo journalctl -u snell-server.service -n 50` |
 
-Upgrades preserve your connection key and briefly interrupt connections. If the new version fails startup checks, the tool attempts to restore the previous deployment. Test with Surge after upgrading. To recover, run `rollback`, then export the restored configuration and update your client.
+Upgrades preserve your connection key and briefly interrupt connections. After confirmation, an independent transient systemd service runs the upgrade. Disconnecting SSH or pressing Ctrl-C to stop watching logs does not cancel a task that has started. Reconnect and run `sudo snellctl status` for progress or results, or `sudo journalctl -u snellctl-upgrade.service -n 50 --no-pager` for upgrade logs. If the new version fails startup checks, the tool attempts to restore the previous deployment.
+
+Test with Surge after upgrading. When upgrading across major versions, update the proxy's `version` parameter or run `sudo snellctl export` again. To recover, run `rollback`, then export the restored configuration and update your client.
+
+Terminal output uses sections and color to highlight status, warnings and errors. Redirected output and `NO_COLOR=1` disable color. `export` always prints only the plain configuration line.
 
 `self-update` updates `/usr/local/sbin/snellctl` from this project’s `main` branch without restarting Snell or changing configuration or rollback data. Download or validation failures preserve the existing tool; add `--yes` for unattended use. If your installed tool does not support this command, download the script again using the installation steps and run `sudo bash snell.sh self-update`.
 

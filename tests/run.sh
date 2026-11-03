@@ -106,6 +106,7 @@ uninstall_removes_data() (
   BASE="$TEST_ROOT/uninstall"
   confirm() { printf 'confirmed\n' >>"$TEST_ROOT/uninstall-actions"; }
   remove_runtime() { printf 'runtime\n' >>"$TEST_ROOT/uninstall-actions"; }
+  systemctl() { case "$*" in *SubState*) printf 'dead\n' ;; *) : ;; esac; }
   regular_owned() { [[ -f "$1" ]]; }
   id() { case "$1" in -u) echo 123 ;; -g) echo 456 ;; esac; }
   userdel() { eq "$1" snell; printf 'user\n' >>"$TEST_ROOT/uninstall-actions"; }
@@ -119,6 +120,96 @@ uninstall_removes_data() (
   [[ ! -e "$BASE" ]] || fail 'uninstall retained deployment data'
   eq "$(cat "$TEST_ROOT/uninstall-actions")" $'confirmed\nruntime\nuser\ngroup'
 ) # Isolate account-command stubs from the rest of the suite.
+upgrade_handoff() {
+  COMMAND=upgrade CHANNEL='' EXACT='' ALLOW_DOWNGRADE=0
+  TARGET=6.0.0 TARGET_CHANNEL=stable ARCH=amd64
+  local actions="$TEST_ROOT/handoff-actions"
+  : >"$actions"
+  check_owned_files() { :; }
+  recover_transaction() { :; }
+  check_current() { :; }
+  load_settings() { SERVER=example.com PORT=443 PSK=private-key; }
+  resolve_target() { :; }
+  current_id() { printf 'g-old\n'; }
+  jq() { case "$*" in *installed*) printf 'true\n' ;; *version*) printf '5.0.1\n' ;; *channel*) printf 'stable\n' ;; esac; }
+  confirm() { printf 'confirm\n' >>"$actions"; }
+  start_upgrade() { printf 'handoff\n' >>"$actions"; }
+  init_layout() { fail 'foreground upgrade reached deployment writes'; }
+  run_deploy
+  eq "$(cat "$actions")" $'confirm\nhandoff'
+  : >"$actions"
+  confirm() { exit 1; }
+  no_cmd run_deploy
+  eq "$(cat "$actions")" ''
+}
+
+terminal_output() {
+  local output
+  output=$(heading 'Snell status'; field 'Selected' 6.0.0; success active; warn example 2>&1)
+  [[ "$output" != *$'\033'* ]] || fail 'redirected output contains ANSI escapes'
+  [[ "$output" == *'  Selected       6.0.0'* ]] || fail 'status labels are not aligned'
+  [[ "$output" == *'Warning: example'* ]] || fail 'warning lost its plain-text label'
+}
+
+terminal_colors() {
+  local colored plain dumb
+  colored=$(TERM=xterm script -qec "bash '$ROOT/snell.sh' --help" /dev/null)
+  [[ "$colored" == *$'\033[1;36m'* ]] || fail 'terminal heading has no color'
+  plain=$(NO_COLOR=1 TERM=xterm script -qec "bash '$ROOT/snell.sh' --help" /dev/null)
+  [[ "$plain" != *$'\033'* ]] || fail 'NO_COLOR was ignored'
+  dumb=$(TERM=dumb script -qec "bash '$ROOT/snell.sh' --help" /dev/null)
+  [[ "$dumb" != *$'\033'* ]] || fail 'dumb terminal contains ANSI escapes'
+}
+
+upgrade_worker_contract() {
+  setup_snapshots
+  local invocation="$TEST_ROOT/worker-args"
+  main() {
+    parse_args "$@"
+    printf '%s\n' "$UPGRADE_WORKER" "$EXPECTED_CURRENT" "$APPROVED_CHANNEL" "$@" >"$invocation"
+  }
+  upgrade_worker g-old 6.0.0 beta 1
+  eq "$(cat "$invocation")" $'1\ng-old\nbeta\nupgrade\n--version\n6.0.0\n--yes\n--allow-downgrade'
+}
+
+upgrade_task() {
+  setup_snapshots
+  SELF="$ROOT/snell.sh" TARGET=6.0.0 TARGET_CHANNEL=rc ALLOW_DOWNGRADE=1
+  local args="$TEST_ROOT/systemd-args" test_state=dead test_result=success
+  systemctl() {
+    case "$*" in
+      *SubState*) printf '%s\n' "$test_state" ;;
+      *reset-failed*|*stop*) test_state=dead ;;
+      *InvocationID*) printf 'test-invocation\n' ;;
+      *Result*) printf '%s\n' "$test_result" ;;
+      *) fail "unexpected systemctl call: $*" ;;
+    esac
+  }
+  systemd-run() { printf '%s\n' "$@" >"$args"; test_state=exited; }
+  journalctl() { :; }
+  acquire_lock
+  OWNERSHIP_CHECKED=1
+  start_upgrade
+  eq "$LOCKED:$OWNERSHIP_CHECKED" '0:0'
+  grep -Fxq -- '--property=StandardInput=null' "$args" || fail 'worker stdin is attached'
+  grep -Fxq -- '--property=StandardOutput=journal' "$args" || fail 'worker stdout is attached'
+  grep -Fxq -- '--property=StandardError=journal' "$args" || fail 'worker stderr is attached'
+  eq "$(tail -n 6 "$args")" $'snellctl-worker\n'"$LOCK_DIR/upgrade.sh"$'\ng-old\n6.0.0\nrc\n1'
+  yes_cmd cmp -s "$SELF" "$LOCK_DIR/upgrade.sh"
+  no_cmd grep -Eq -- '^--(pipe|pty|scope)' "$args"
+  printf '%s\n' --pipe >>"$args"
+  yes_cmd grep -Eq -- '^--(pipe|pty|scope)' "$args"
+  yes_cmd bash -c '. "$1/snell.sh"; LOCK_DIR="$2"; acquire_lock' _ "$ROOT" "$LOCK_DIR"
+  test_state=running
+  no_cmd start_upgrade
+  test_state=dead
+  systemd-run() { return 1; }
+  no_cmd start_upgrade
+  test_state=dead test_result=exit-code
+  systemd-run() { test_state=failed; }
+  no_cmd start_upgrade
+}
+
 config_versions() {
   local v server_config snippet
   SERVER=example.com PORT=443 PSK=abcdefghijklmnopqrstuvwxyz0123456789
@@ -332,8 +423,13 @@ case_run 'official parser and original RC truncation regression' catalog_parse
 case_run 'strict channels, missing architecture and unknown major' channel_selection
 case_run 'Markdown-to-HTML fallback and network failure' fallback_discovery
 case_run 'CLI and endpoint validation' input_contract
+case_run 'upgrade hands off only after confirmation, before foreground writes' upgrade_handoff
+case_run 'readable plain output without terminal escapes' terminal_output
 case_run 'v5 / early v6 beta / RC / final configuration generation' config_versions
 if [[ $(uname -s) == Linux && $EUID == 0 ]]; then
+  case_run 'terminal colors, NO_COLOR and dumb terminal' terminal_colors
+  case_run 'upgrade worker pins approved version and saved channel' upgrade_worker_contract
+  case_run 'detached upgrade task, lock handoff, duplicate and failure results' upgrade_task
   case_run 'manager self-update, failures, ownership and deployment isolation' manager_update
   case_run 'complete snapshot switch and offline rollback' snapshot_success
   case_run 'failed startup restores binary/config/export/state' snapshot_failure

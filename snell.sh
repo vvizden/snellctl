@@ -16,12 +16,24 @@ DOWNLOAD_BASE=https://dl.nssurge.com/snell
 ARCH='' COMMAND='' CHANNEL='' EXACT='' SERVER='' PORT='' PSK=''
 YES=0 NON_INTERACTIVE=0 ALLOW_DOWNGRADE=0 LOCKED=0 OWNERSHIP_CHECKED=0
 WORK='' TARGET='' TARGET_URL='' TARGET_CHANNEL='' NEW_GEN=''
+UPGRADE_UNIT=snellctl-upgrade.service
+UPGRADE_WORKER=0 EXPECTED_CURRENT='' APPROVED_CHANNEL='' JOURNAL_PID=''
 
+paint() {
+  local color=$1; shift
+  if [[ -t 1 && ${TERM:-dumb} != dumb && ! ${NO_COLOR+x} ]]; then
+    printf '\033[%sm%s\033[0m' "$color" "$*"
+  else printf '%s' "$*"; fi
+}
 log() { printf '%s\n' "$*"; }
-warn() { printf 'Warning: %s\n' "$*" >&2; }
-die() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+heading() { printf '\n'; paint '1;36' "$*"; printf '\n'; }
+field() { printf '  %-14s %s\n' "$1" "$2"; }
+success() { paint '1;32' "$*"; printf '\n'; }
+warn() { { paint '1;33' 'Warning: '; printf '%s\n' "$*"; } >&2; }
+die() { { paint '1;31' 'Error: '; printf '%s\n' "$*"; } >&2; exit 1; }
 usage() {
-  printf 'Manager version: %s\n' "$MANAGER_VERSION"
+  heading 'snellctl'
+  field 'Manager' "$MANAGER_VERSION"
   cat <<'EOF'
 snellctl — native Snell, one instance, complete deployment rollback
 
@@ -509,7 +521,8 @@ run_self_update() {
   local version effective
   secure_dir "${MANAGER%/*}" || die "Unsafe manager directory"
   managed_file "$MANAGER" || die "No owned snellctl command at $MANAGER"
-  log "Update snellctl from $MANAGER_URL"
+  heading 'Update snellctl'
+  field 'Source' "$MANAGER_URL"
   confirm
   MANAGER_STAGE=$(mktemp "${MANAGER}.XXXXXXXX")
   effective=$(curl -fLsS --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 10 --max-time 180 \
@@ -609,6 +622,10 @@ cleanup_exit() {
   local status=$?
   trap - EXIT INT TERM
   set +e
+  if [[ -n "$JOURNAL_PID" ]]; then
+    kill "$JOURNAL_PID" 2>/dev/null
+    wait "$JOURNAL_PID" 2>/dev/null
+  fi
   [[ -z "$MANAGER_STAGE" ]] || rm -f -- "$MANAGER_STAGE"
   if (( LOCKED && OWNERSHIP_CHECKED )) && owned_base; then
     if [[ -e "$BASE/transaction.json" ]]; then recover_transaction || warn 'Recovery incomplete; rerun snellctl before any further changes'; status=1; fi
@@ -616,6 +633,78 @@ cleanup_exit() {
     [[ ! -e "$BASE/state.json" ]] || prune_generations
   fi
   exit "$status"
+}
+
+upgrade_running() {
+  local state
+  state=$(systemctl show "$UPGRADE_UNIT" -p SubState --value 2>/dev/null || true)
+  case "$state" in start*|running|stop*) return 0 ;; *) return 1 ;; esac
+}
+show_upgrade() {
+  local state result
+  state=$(systemctl show "$UPGRADE_UNIT" -p SubState --value 2>/dev/null || true)
+  case "$state" in
+    start*|running|stop*) field 'Upgrade' 'in progress (continues after SSH disconnects)' ;;
+    exited) field 'Last upgrade' 'completed' ;;
+    failed)
+      result=$(systemctl show "$UPGRADE_UNIT" -p ExecMainStatus --value)
+      field 'Last upgrade' "failed (exit $result); inspect upgrade logs" ;;
+    *) return 0 ;;
+  esac
+  field 'Upgrade logs' "journalctl -u $UPGRADE_UNIT -n 50 --no-pager"
+}
+upgrade_worker() {
+  UPGRADE_WORKER=1 EXPECTED_CURRENT=$1 APPROVED_CHANNEL=$3
+  local args=(upgrade --version "$2" --yes)
+  [[ "$4" != 1 ]] || args+=(--allow-downgrade)
+  main "${args[@]}"
+}
+start_upgrade() {
+  local state invocation result expected script parent
+  expected=$(current_id)
+  require_tools systemd-run journalctl
+  regular_owned "$SELF" || die 'Upgrade script must be owned by root and not writable by other users'
+  parent=${SELF%/*}
+  while :; do
+    secure_dir "$parent" || die 'Upgrade script must be in root-owned directories; use the installed snellctl command'
+    [[ "$parent" != / ]] || break
+    parent=${parent%/*}; parent=${parent:-/}
+  done
+  script="$LOCK_DIR/upgrade.sh"
+  [[ ! -e "$script" && ! -L "$script" ]] || regular_owned "$script" || die 'Unsafe upgrade script snapshot'
+  upgrade_running && die 'Another upgrade is running; check snellctl status'
+  state=$(systemctl show "$UPGRADE_UNIT" -p SubState --value 2>/dev/null || true)
+  case "$state" in
+    exited) systemctl stop "$UPGRADE_UNIT" ;;
+    failed) systemctl reset-failed "$UPGRADE_UNIT" ;;
+  esac
+  install -m 0700 "$SELF" "$script"
+  heading 'Upgrade task'
+  log 'The upgrade will continue if SSH disconnects. Ctrl-C only stops watching.'
+  field 'Reconnect' 'sudo snellctl status'
+  field 'Logs' "journalctl -u $UPGRADE_UNIT -n 50 --no-pager"
+  # The worker takes its own lock; this process must never recover its transaction.
+  OWNERSHIP_CHECKED=0 LOCKED=0
+  exec 9>&-
+  # Arguments are expanded by the worker shell, never interpolated into shell code.
+  # shellcheck disable=SC2016
+  systemd-run --quiet --unit="$UPGRADE_UNIT" --description='Snell upgrade' \
+    --property=Type=exec --property=RemainAfterExit=yes --property=UMask=0077 \
+    --property=StandardInput=null --property=StandardOutput=journal --property=StandardError=journal \
+    /bin/bash -c 'source "$1"; upgrade_worker "$2" "$3" "$4" "$5"' \
+    snellctl-worker "$script" "$expected" "$TARGET" "$TARGET_CHANNEL" "$ALLOW_DOWNGRADE" \
+    || die 'Could not start upgrade task; deployment unchanged'
+  invocation=$(systemctl show "$UPGRADE_UNIT" -p InvocationID --value)
+  journalctl --no-pager -o cat -n 50 -f "_SYSTEMD_INVOCATION_ID=$invocation" &
+  JOURNAL_PID=$!
+  while upgrade_running; do sleep 1; done
+  kill "$JOURNAL_PID" 2>/dev/null || true
+  wait "$JOURNAL_PID" 2>/dev/null || true
+  JOURNAL_PID=''
+  result=$(systemctl show "$UPGRADE_UNIT" -p Result --value)
+  state=$(systemctl show "$UPGRADE_UNIT" -p SubState --value)
+  [[ "$result" == success && "$state" == exited ]] || die "Upgrade failed; inspect journalctl -u $UPGRADE_UNIT -n 50 --no-pager"
+  success 'Upgrade completed. Run sudo snellctl status to inspect the deployment.'
 }
 
 run_deploy() {
@@ -627,8 +716,12 @@ run_deploy() {
     check_owned_files
     recover_transaction || die "Cannot recover unfinished transaction"
     check_current
+    if (( UPGRADE_WORKER )); then
+      [[ $(current_id) == "$EXPECTED_CURRENT" ]] || die 'Deployment changed after confirmation; rerun upgrade'
+    fi
     [[ $(jq -r .installed "$BASE/state.json") == true ]] || die "Service was uninstalled; run uninstall to remove retained data before a fresh install"
     load_settings
+    if (( UPGRADE_WORKER )); then TARGET_CHANNEL=$APPROVED_CHANNEL; fi
   fi
   resolve_target
   if [[ "$COMMAND" == upgrade ]]; then
@@ -636,19 +729,26 @@ run_deploy() {
     old_key=$(version_key "$old_version"); target_key=$(version_key "$TARGET")
     [[ "$target_key" > "$old_key" || "$target_key" == "$old_key" || "$ALLOW_DOWNGRADE" == 1 ]] || die "Refusing downgrade $old_version -> $TARGET; use --version and --allow-downgrade"
     if [[ "$old_version" == "$TARGET" && "$TARGET_CHANNEL" == "$(jq -r .channel "$BASE/generations/$id/metadata.json")" ]]; then
-      log "Already on $TARGET ($TARGET_CHANNEL). Nothing changed."; return 0
+      success "Already on $TARGET ($TARGET_CHANNEL). Nothing changed."; return 0
     fi
   fi
-  log "Operation: $COMMAND | ${old_version:-none} -> $TARGET | channel: $TARGET_CHANNEL | protocol: ${TARGET%%.*}"
-  log "Public endpoint: $SERVER:$PORT | Surge: version=${TARGET%%.*}, reuse=true, block-quic=on"
+  heading "Snell $COMMAND"
+  field 'Version' "${old_version:-none} -> $TARGET"
+  field 'Channel' "$TARGET_CHANNEL"
+  field 'Endpoint' "$SERVER:$PORT"
+  field 'Surge' "version=${TARGET%%.*}, reuse=true, block-quic=on"
   [[ $(version_channel "$TARGET") == stable ]] || warn 'Prerelease: the Surge client may require a compatible update. Local health checks cannot prove protocol compatibility.'
   [[ -z "${old_version:-}" ]] || log 'Connections will briefly disconnect. PSK and endpoint are preserved.'
   confirm
+  if [[ "$COMMAND" == upgrade && "$UPGRADE_WORKER" == 0 ]]; then
+    start_upgrade
+    return
+  fi
   init_layout
   stage_generation
   switch_generation "$NEW_GEN"
   prune_generations
-  log "Installed Snell $TARGET. Local process/listener checks passed; client connectivity is not yet verified."
+  success "Installed Snell $TARGET. Local process/listener checks passed; client connectivity is not yet verified."
   log "Allow inbound TCP $PORT in your firewall and provider security group. No firewall settings were changed."
   log 'Run sudo snellctl export to obtain the Surge configuration (contains the PSK).'
 }
@@ -656,42 +756,72 @@ run_versions() {
   local catalog v a url key channel selected dir
   require_tools curl
   catalog=$(fetch_catalog) || die "Unable to query official versions"
-  log 'Officially discoverable versions (not a complete historical archive):'
+  heading 'Official versions'
+  log 'Discoverable releases; not a complete historical archive.'
+  printf '  %-16s %-12s %s\n' 'VERSION' 'ARCH' 'CHANNEL'
   while IFS=$'\t' read -r v a url; do
     key=$(version_key "$v") || continue
     printf '%s\t%s\t%s\t%s\n' "$key" "$v" "$a" "$(version_channel "$v")"
-  done <<<"$catalog" | LC_ALL=C sort -r | cut -f2-
+  done <<<"$catalog" | LC_ALL=C sort -r | while IFS=$'\t' read -r key v a channel; do
+    printf '  %-16s %-12s %s\n' "$v" "$a" "$channel"
+  done
+  heading "Channel targets ($ARCH)"
   for channel in stable rc beta; do
-    if selected=$(select_release "$catalog" "$channel" "$ARCH"); then log "$channel ($ARCH): ${selected%%$'\t'*}"; else log "$channel ($ARCH): unavailable / management-tool update required"; fi
+    if selected=$(select_release "$catalog" "$channel" "$ARCH" 2>/dev/null); then
+      field "$channel" "${selected%%$'\t'*}"
+    else
+      field "$channel" 'unavailable; no matching supported download'
+    fi
   done
   if [[ -d "$BASE" ]]; then
-    log 'Local snapshots: run sudo snellctl status for verified deployment details.'
+    heading 'Local snapshots'
+    log 'Run sudo snellctl status for verified deployment details.'
     if (( EUID == 0 )) && owned_base && command -v jq >/dev/null; then
       for dir in "$BASE"/generations/g-*; do
         [[ -d "$dir" ]] || continue
-        if verify_generation "${dir##*/}"; then jq -r --arg id "${dir##*/}" '"\($id)\t\(.version)\t\(.channel)"' "$dir/metadata.json"; fi
+        if verify_generation "${dir##*/}"; then
+          field "$(jq -r .version "$dir/metadata.json")" "$(jq -r .channel "$dir/metadata.json") (${dir##*/})"
+        fi
       done
     fi
   fi
 }
 run_status() {
-  local id dir previous pid executable version
+  local id dir previous pid executable version state
+  heading 'Snell status'
+  show_upgrade
   id=$(current_id) || { log 'No completed deployment.'; return 0; }
   check_current
   dir="$BASE/generations/$id"
-  jq -r '"Selected: \(.version) | protocol: \(.protocol) | channel: \(.channel)\nEndpoint: \(.settings.server):\(.settings.port)\nSource: \(.url)\nChecksum: \(.checksum)"' "$dir/metadata.json"
-  log "Binary version report: $(jq -r '.binary_reported_version // .version' "$dir/metadata.json")"
-  log "Installed: $(jq -r .installed "$BASE/state.json")"
-  previous=$(jq -r '.previous // empty' "$BASE/state.json")
-  if [[ -n "$previous" ]] && verify_generation "$previous"; then log "Rollback: $(jq -r .version "$BASE/generations/$previous/metadata.json") ($previous)"; else log 'Rollback: unavailable'; fi
+  state=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+  if [[ "$state" == active ]]; then
+    printf '  %-14s ' 'Service'; success "$state"
+  else field 'Service' "$state"; fi
+  field 'Selected' "$(jq -r .version "$dir/metadata.json")"
+  field 'Protocol' "$(jq -r .protocol "$dir/metadata.json")"
+  field 'Channel' "$(jq -r .channel "$dir/metadata.json")"
+  field 'Endpoint' "$(jq -r '"\(.settings.server):\(.settings.port)"' "$dir/metadata.json")"
+  field 'Installed' "$(jq -r .installed "$BASE/state.json")"
   pid=$(systemctl show "$SERVICE" -p MainPID --value 2>/dev/null || true)
   executable=
   [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] || executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
-  if [[ "$executable" == "$dir/snell-server" ]]; then version=$(jq -r .version "$dir/metadata.json"); log "Running: $version | PID: $pid"; else log 'Running: stopped or does not match selected snapshot'; fi
-  log "Service: $(systemctl is-active "$SERVICE" 2>/dev/null || true)"
-  log 'TCP listener:'
+  if [[ "$executable" == "$dir/snell-server" ]]; then
+    version=$(jq -r .version "$dir/metadata.json")
+    field 'Running' "$version (PID $pid)"
+  else field 'Running' 'stopped or does not match selected snapshot'; fi
+  previous=$(jq -r '.previous // empty' "$BASE/state.json")
+  if [[ -n "$previous" ]] && verify_generation "$previous"; then
+    field 'Rollback' "$(jq -r .version "$BASE/generations/$previous/metadata.json") ($previous)"
+  else field 'Rollback' 'unavailable'; fi
+  heading 'Artifact'
+  field 'Source' "$(jq -r .url "$dir/metadata.json")"
+  field 'Checksum' "$(jq -r .checksum "$dir/metadata.json")"
+  field 'Binary report' "$(jq -r '.binary_reported_version // .version' "$dir/metadata.json")"
+  heading 'TCP listener'
   ss -H -ltn "sport = :$(jq -r .settings.port "$dir/metadata.json")"
-  log "Diagnostics: journalctl -u $SERVICE (review before sharing)."
+  heading 'Diagnostics'
+  log "  journalctl -u $SERVICE -n 50 --no-pager"
+  log '  Review logs before sharing.'
 }
 run_rollback() {
   local previous
@@ -706,9 +836,13 @@ run_rollback() {
 }
 run_uninstall() {
   local dir id current_uid current_gid
+  heading 'Uninstall Snell'
   log 'Remove the managed systemd service and snellctl command.'
   log 'Permanently delete all managed snapshots, credentials and deployment state.'
   confirm
+  upgrade_running && die 'An upgrade is still running; wait before uninstalling'
+  systemctl stop "$UPGRADE_UNIT" >/dev/null 2>&1 || true
+  systemctl reset-failed "$UPGRADE_UNIT" >/dev/null 2>&1 || true
   remove_runtime || die "Unable to remove managed runtime"
   # Refuse recursive deletion if anything outside the owned layout appeared.
   local p name
@@ -755,6 +889,12 @@ main() {
     require_tools curl flock bash cmp
   else
     require_tools jq flock ss sha256sum
+  fi
+  if [[ "$COMMAND" == status ]] && upgrade_running; then
+    heading 'Snell status'
+    show_upgrade
+    log 'Deployment is being switched; run status again after the upgrade finishes.'
+    return
   fi
   acquire_lock
   SELF=$(readlink -f "${BASH_SOURCE[0]}")

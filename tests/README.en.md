@@ -13,7 +13,7 @@ docker build -f tests/Dockerfile -t snellctl-test .
 docker run --rm snellctl-test bash -c 'shellcheck snell.sh && bash tests/run.sh'
 ```
 
-macOS runs six portable groups. The Linux/root container runs all fifteen groups, including real ownership, file hashes, symlink switching, locks and manager self-update. These tests mock systemd and network responses. Use the acceptance steps below to verify the server and Surge together.
+macOS runs eight portable groups. The Linux/root container runs all twenty groups, including upgrade handoff, plain terminal output, real ownership, file hashes, symlink switching, locks and manager self-update. These tests mock systemd and network responses. Use the acceptance steps below to verify the server and Surge together.
 
 ## Real systemd acceptance
 
@@ -30,6 +30,8 @@ docker rm -f snellctl-acceptance
 Repeat with `DISTRO=ubuntu:24.04` and on native amd64/aarch64 hosts. Docker's arm64 platform corresponds to Snell's aarch64 artifact. On an ARM Mac, `--platform linux/amd64` uses emulation and cannot substitute for native amd64 acceptance. The script deliberately pins the 5.0.1 → 6.0.0rc2 → 6.0.0b4 regression sequence; update its expectations when the live RC channel moves.
 
 The suite verifies occupied-port refusal, fresh install, permissions, channel selection, explicit downgrade, PSK preservation, offline rollback, real startup-failure recovery, SIGTERM cleanup, a simulated unfinished transaction, service restart, complete removal with the default uninstall command. Fault injection is confined to the test script. A daemon restart is tested; a full VM reboot and power-loss durability require separate VM acceptance.
+
+Run `tests/upgrade-acceptance.sh` in a separate fresh container with `SNELLCTL_DISPOSABLE_TEST=YES` for the SSH-disconnect regression. It pins 5.0.1 and 6.0.0 and covers interactive confirmation followed by SIGHUP, concurrent-operation refusal, status queries, connected completion, failed health-check rollback, failed-task retry, and reinstall after uninstall. The older `systemd-acceptance.sh` RC-channel assertions require that release to remain discoverable upstream; use the pinned-version suite when the RC has been removed.
 
 ## Surge acceptance
 

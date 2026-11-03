@@ -55,7 +55,11 @@ sudo snellctl export
 | 导出当前 Surge 配置 | `sudo snellctl export` |
 | 查看最近日志 | `sudo journalctl -u snell-server.service -n 50` |
 
-升级保留连接密钥，会短暂中断连接。新版本启动检查失败时，工具会尝试恢复旧部署。升级后，请用 Surge 实际测试；需要恢复时执行 `rollback`，再导出并更新客户端配置。
+升级保留连接密钥，会短暂中断连接。确认后，升级由独立的 systemd 临时服务执行；SSH 断开或按 Ctrl-C 停止查看日志，都不会取消已启动的升级。重连后执行 `sudo snellctl status` 查看进度或结果，执行 `sudo journalctl -u snellctl-upgrade.service -n 50 --no-pager` 查看升级日志。新版本启动检查失败时，工具会尝试恢复旧部署。
+
+升级后，请用 Surge 实际测试；跨主版本升级时，更新节点的 `version` 参数，或重新运行 `sudo snellctl export` 获取配置。需要恢复时执行 `rollback`，再导出并更新客户端配置。
+
+终端输出按区块排列，并自动使用颜色突出状态、警告和错误。重定向输出或设置 `NO_COLOR=1` 时不使用颜色，`export` 始终只输出原始配置行。
 
 `self-update` 从本项目 `main` 分支更新 `/usr/local/sbin/snellctl`，不重启 Snell，也不修改配置或回滚数据。下载或校验失败时保留原工具；无人值守执行时添加 `--yes`。旧版工具若不支持此命令，按安装步骤重新下载脚本后执行 `sudo bash snell.sh self-update`。
 

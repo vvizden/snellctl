@@ -13,7 +13,7 @@ docker build -f tests/Dockerfile -t snellctl-test .
 docker run --rm snellctl-test bash -c 'shellcheck snell.sh && bash tests/run.sh'
 ```
 
-macOS 运行 6 组通用测试，Linux / root 容器运行全部 15 组，覆盖文件所有权、哈希、链接切换、锁和管理工具自更新。这些测试模拟 systemd 和网络响应；服务端与 Surge 的实际运行按下述步骤验证。
+macOS 运行 8 组通用测试，Linux / root 容器运行全部 20 组，覆盖升级任务交接、终端纯文本输出、文件所有权、哈希、链接切换、锁和管理工具自更新。这些测试模拟 systemd 和网络响应；服务端与 Surge 的实际运行按下述步骤验证。
 
 ## systemd 验收
 
@@ -30,6 +30,8 @@ docker rm -f snellctl-acceptance
 使用 `DISTRO=ubuntu:24.04` 重复测试，并分别在 amd64 和 aarch64 主机上验收。Docker 的 arm64 对应 Snell 的 aarch64。ARM Mac 上的 `--platform linux/amd64` 属于模拟执行，amd64 主机验收需单独完成。
 
 脚本固定验证 `5.0.1 → 6.0.0rc2 → 6.0.0b4`，RC 通道更新后应同步调整预期。测试覆盖端口占用、安装、权限、通道切换、降级、密钥保留、离线回滚、启动失败恢复、SIGTERM 中断恢复、未完成事务恢复、服务重启及卸载清理。故障注入集中在测试脚本中。系统重启与断电恢复需在虚拟机中另行验收。
+
+升级断线回归测试使用另一个全新容器，运行 `tests/upgrade-acceptance.sh`（同样设置 `SNELLCTL_DISPOSABLE_TEST=YES`）。该脚本固定使用 5.0.1 和 6.0.0，覆盖交互式确认后 SIGHUP 断线、并发拒绝、状态查询、正常返回、健康检查失败回退、失败任务重试，以及卸载后重装。现有 `systemd-acceptance.sh` 的在线 RC 通道断言依赖上游仍提供对应版本；RC 已撤下时请使用指定版本测试。
 
 ## Surge 验收
 
