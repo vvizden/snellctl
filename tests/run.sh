@@ -188,6 +188,8 @@ upgrade_task() {
   systemd-run() { printf '%s\n' "$@" >"$args"; test_state=exited; }
   journalctl() { :; }
   acquire_lock
+  install -m 0755 "$ROOT/snell.sh" "$LOCK_DIR/manager"
+  SELF="$LOCK_DIR/manager"
   OWNERSHIP_CHECKED=1
   start_upgrade
   eq "$LOCKED:$OWNERSHIP_CHECKED" '0:0'
